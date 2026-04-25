@@ -1,0 +1,10 @@
+# Python and Django environment
+expense_env/
+__pycache__/
+*.pyc
+
+# Local Database (Just in case, though we use Aiven)
+db.sqlite3
+
+# VS Code settings
+.vscode/
