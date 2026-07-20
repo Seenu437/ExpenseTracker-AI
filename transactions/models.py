@@ -1,85 +1,282 @@
 from django.conf import settings
+from django.core.exceptions import ValidationError
+from django.core.validators import MinValueValidator
 from django.db import models
+from django.db.models import Q
 
 
 class Category(models.Model):
+    """
+    Stores transaction categories.
+    Categories can be default (global) or user-specific.
+    """
 
     CATEGORY_TYPES = [
-        ('Need', 'Need'),
-        ('Want', 'Want'),
-        ('Savings', 'Savings'),
-        ('Income', 'Income'),
+        ("Need", "Need"),
+        ("Want", "Want"),
+        ("Savings", "Savings"),
+        ("Income", "Income"),
     ]
 
     user = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,
         null=True,
-        blank=True
+        blank=True,
+        related_name="categories",
     )
 
-    category_name = models.CharField(max_length=100)
+    name = models.CharField(
+        max_length=100,
+    )
 
     category_type = models.CharField(
         max_length=20,
-        choices=CATEGORY_TYPES
+        choices=CATEGORY_TYPES,
     )
 
-    is_active = models.BooleanField(default=True)
+    is_default = models.BooleanField(
+        default=False,
+    )
+
+    created_at = models.DateTimeField(
+        auto_now_add=True,
+    )
+
+    updated_at = models.DateTimeField(
+        auto_now=True,
+    )
+
+    class Meta:
+        ordering = ["name"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["user", "name"],
+                name="unique_category_name_per_user",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    (Q(is_default=True) & Q(user__isnull=True)) |
+                    (Q(is_default=False))
+                ),
+                name="default_category_must_not_have_user",
+            ),
+        ]
+
+    def clean(self):
+        if self.is_default and self.user is not None:
+            raise ValidationError(
+                {"user": "Default categories must not be assigned to a user."}
+            )
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        super().save(*args, **kwargs)
 
     def __str__(self):
-        return self.category_name
+        owner = "Default" if self.user is None else self.user.username
+        return f"{self.name} ({owner})"
 
 
 class Transaction(models.Model):
+    """
+    Stores income and expense transactions.
+    """
+
+    TRANSACTION_TYPES = [
+        ("Income", "Income"),
+        ("Expense", "Expense"),
+    ]
+
+    PAYMENT_METHODS = [
+        ("Cash", "Cash"),
+        ("UPI", "UPI"),
+        ("Credit Card", "Credit Card"),
+        ("Debit Card", "Debit Card"),
+        ("Bank Transfer", "Bank Transfer"),
+        ("Other", "Other"),
+    ]
 
     user = models.ForeignKey(
         settings.AUTH_USER_MODEL,
-        on_delete=models.CASCADE
+        on_delete=models.CASCADE,
+        related_name="transactions",
     )
 
     category = models.ForeignKey(
         Category,
-        on_delete=models.RESTRICT
+        on_delete=models.PROTECT,
+        related_name="transactions",
+    )
+
+    transaction_type = models.CharField(
+        max_length=10,
+        choices=TRANSACTION_TYPES,
     )
 
     amount = models.DecimalField(
         max_digits=10,
-        decimal_places=2
+        decimal_places=2,
+        validators=[MinValueValidator(0.01)],
     )
 
-    PAYMENT_METHODS = [
-        ('Cash', 'Cash'),
-        ('UPI', 'UPI'),
-        ('Credit Card', 'Credit Card'),
-        ('Debit Card', 'Debit Card'),
-        ('Bank Transfer', 'Bank Transfer'),
-        ('Wallet', 'Wallet'),
-        ]
-
     payment_method = models.CharField(
-        max_length=20,
+        max_length=30,
         choices=PAYMENT_METHODS,
-        default='UPI'
     )
 
     transaction_date = models.DateField()
 
-    description = models.CharField(
-        max_length=255,
+    description = models.TextField(
         blank=True,
-        null=True
     )
 
-    created_at = models.DateTimeField(auto_now_add=True)
+    created_at = models.DateTimeField(
+        auto_now_add=True,
+    )
+
+    updated_at = models.DateTimeField(
+        auto_now=True,
+    )
 
     class Meta:
+        ordering = ["-transaction_date", "-created_at"]
         indexes = [
-            models.Index(
-                fields=['user', 'transaction_date'],
-                name='idx_user_date'
-            )
+            models.Index(fields=["user", "transaction_date"]),
+            models.Index(fields=["user", "category"]),
+            models.Index(fields=["user", "transaction_type"]),
+        ]
+        constraints = [
+            models.CheckConstraint(
+                condition=Q(amount__gt=0),
+                name="transaction_amount_gt_zero",
+            ),
         ]
 
+    def clean(self):
+        errors = {}
+
+        if self.category.user is not None and self.category.user != self.user:
+            errors["category"] = "Selected category does not belong to this user."
+
+        if self.transaction_type == "Income" and self.category.category_type != "Income":
+            errors["transaction_type"] = (
+                "Income transactions must use a category of type 'Income'."
+            )
+
+        if self.transaction_type == "Expense" and self.category.category_type == "Income":
+            errors["transaction_type"] = (
+                "Expense transactions cannot use a category of type 'Income'."
+            )
+
+        if errors:
+            raise ValidationError(errors)
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        super().save(*args, **kwargs)
+
     def __str__(self):
-        return f"{self.user.username} - ₹{self.amount}"
+        return (
+            f"{self.user.username} - "
+            f"{self.transaction_type} - "
+            f"{self.amount} on {self.transaction_date}"
+        )
+
+
+class Budget(models.Model):
+    """
+    Stores overall or category-based budgets.
+    """
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="budgets",
+    )
+
+    category = models.ForeignKey(
+        Category,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="budgets",
+    )
+
+    budget_limit = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        validators=[MinValueValidator(0.01)],
+    )
+
+    start_date = models.DateField()
+
+    end_date = models.DateField()
+
+    is_active = models.BooleanField(
+        default=True,
+    )
+
+    created_at = models.DateTimeField(
+        auto_now_add=True,
+    )
+
+    updated_at = models.DateTimeField(
+        auto_now=True,
+    )
+
+    class Meta:
+        ordering = ["-start_date"]
+        indexes = [
+            models.Index(fields=["user", "is_active"]),
+            models.Index(fields=["user", "start_date", "end_date"]),
+        ]
+        constraints = [
+            models.CheckConstraint(
+                condition=Q(budget_limit__gt=0),
+                name="budget_limit_gt_zero",
+            ),
+            models.CheckConstraint(
+                condition=Q(end_date__gte=models.F("start_date")),
+                name="budget_end_date_gte_start_date",
+            ),
+        ]
+
+    def clean(self):
+        errors = {}
+
+        if self.category and self.category.user is not None and self.category.user != self.user:
+            errors["category"] = "Selected category does not belong to this user."
+
+        if self.category and self.category.category_type == "Income":
+            errors["category"] = "Income categories cannot be used for budgets."
+
+        overlapping_budgets = Budget.objects.filter(
+            user=self.user,
+            category=self.category,
+            is_active=True,
+            start_date__lte=self.end_date,
+            end_date__gte=self.start_date,
+        ).exclude(pk=self.pk)
+
+        if overlapping_budgets.exists():
+            if self.category:
+                errors["category"] = (
+                    "An active budget for this category already exists in the selected date range."
+                )
+            else:
+                errors["category"] = (
+                    "An active overall budget already exists in the selected date range."
+                )
+
+        if errors:
+            raise ValidationError(errors)
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        if self.category:
+            return f"{self.user.username} - {self.category.name} Budget"
+        return f"{self.user.username} - Overall Budget"
